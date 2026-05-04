@@ -14,12 +14,16 @@ import { z } from "zod";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const tokenFilePath = path.join(__dirname, '.access-token.txt');
+const defaultSitePath = path.join(__dirname, '.default-site.json');
 const clientId = process.env.AZURE_CLIENT_ID || '14d82eec-204b-4c2f-b7e8-296a70dab67e'; // Default: Microsoft Graph Explorer App ID
-const scopes = ['Notes.Read', 'Notes.ReadWrite', 'Notes.Create', 'User.Read'];
+const tenantId = process.env.AZURE_TENANT_ID || 'common'; // Set to your tenant GUID for single-tenant work apps; 'common' or 'consumers' otherwise
+const scopes = ['Notes.Read', 'Notes.ReadWrite', 'Notes.Create', 'Notes.Read.All', 'Notes.ReadWrite.All', 'User.Read', 'Sites.Read.All'];
 
 // --- Global State ---
 let accessToken = null;
 let graphClient = null;
+let currentSiteId = null;     // SharePoint site id active for this session (null = personal OneNote)
+let currentSiteName = null;   // Human-readable name for the active site
 
 // --- MCP Server Initialization ---
 const server = new McpServer({
@@ -209,20 +213,54 @@ function textToHtml(text) {
 // ============================================================================
 
 /**
+ * Returns the OneNote root path. Resolution order:
+ *   1. Explicit `siteId` argument (per-call override)
+ *   2. Session default `currentSiteId` (set by useSite tool)
+ *   3. Personal OneNote (/me/onenote)
+ * @param {string} [siteId] - Optional explicit SharePoint site id.
+ * @returns {string} The OneNote API root path.
+ */
+function onenoteRoot(siteId) {
+  const effective = siteId || currentSiteId;
+  return effective ? `/sites/${effective}/onenote` : '/me/onenote';
+}
+
+/**
+ * Loads a previously-saved default site from disk (if any).
+ * Called once at startup so the user doesn't have to call useSite every session.
+ */
+function loadDefaultSite() {
+  try {
+    if (fs.existsSync(defaultSitePath)) {
+      const data = JSON.parse(fs.readFileSync(defaultSitePath, 'utf8'));
+      if (data.siteId) {
+        currentSiteId = data.siteId;
+        currentSiteName = data.siteName || null;
+        console.error(`📍 Default site restored: ${currentSiteName || currentSiteId}`);
+      }
+    }
+  } catch (err) {
+    console.error(`Could not load default site: ${err.message}`);
+  }
+}
+
+/**
  * Fetches the content of a OneNote page.
  * @param {string} pageId - The ID of the page.
  * @param {'httpDirect' | 'direct'} [method='httpDirect'] - The method to use for fetching.
+ * @param {string} [siteId] - Optional SharePoint site id; defaults to the user's personal OneNote.
  * @returns {Promise<string>} The HTML content of the page.
  */
-async function fetchPageContentAdvanced(pageId, method = 'httpDirect') {
+async function fetchPageContentAdvanced(pageId, method = 'httpDirect', siteId = undefined) {
   await ensureGraphClient();
+  const root = onenoteRoot(siteId);
   if (method === 'httpDirect') {
-    const url = `https://graph.microsoft.com/v1.0/me/onenote/pages/${pageId}/content`;
+    const url = `https://graph.microsoft.com/v1.0${root}/pages/${pageId}/content`;
     const response = await fetch(url, { headers: { 'Authorization': `Bearer ${accessToken}` } });
     if (!response.ok) throw new Error(`HTTP error fetching page content! Status: ${response.status} ${response.statusText}`);
     return await response.text();
   } else { // 'direct'
-    return await graphClient.api(`/me/onenote/pages/${pageId}/content`).get();
+    return await graphClient.api(`${root}/pages/${pageId}/content`).get();
   }
 }
 
@@ -258,6 +296,7 @@ server.tool(
       let deviceCodeInfo = null;
       const credential = new DeviceCodeCredential({
         clientId: clientId,
+        tenantId: tenantId,
         userPromptCallback: (info) => {
           deviceCodeInfo = info;
           console.error(`\n=== AUTHENTICATION REQUIRED ===\n${info.message}\n================================\n`);
@@ -344,17 +383,20 @@ Token loaded and verified.
 server.tool(
   'listNotebooks',
   {
-    // No input parameters
+    siteId: z.string().describe('Optional SharePoint site id override. Omit to use the active context (personal OneNote, or whatever was set by useSite).').optional()
   },
-  async () => {
+  async ({ siteId }) => {
     try {
       await ensureGraphClient();
-      const response = await graphClient.api('/me/onenote/notebooks').get();
+      const response = await graphClient.api(`${onenoteRoot(siteId)}/notebooks`).get();
+      const ctxLabel = (siteId || currentSiteId)
+        ? `📚 **Notebooks on ${currentSiteName || 'this site'}**`
+        : '📚 **Your personal OneNote Notebooks**';
       if (response.value && response.value.length > 0) {
         const notebookList = response.value.map((nb, i) => formatPageInfo(nb, i)).join('\n\n');
-        return { content: [{ type: 'text', text: `📚 **Your OneNote Notebooks** (${response.value.length} found):\n\n${notebookList}` }] };
+        return { content: [{ type: 'text', text: `${ctxLabel} (${response.value.length} found):\n\n${notebookList}` }] };
       } else {
-        return { content: [{ type: 'text', text: '📚 No OneNote notebooks found.' }] };
+        return { content: [{ type: 'text', text: `${ctxLabel}: none found.` }] };
       }
     } catch (error) {
       return { isError: true, content: [{ type: 'text', text: error.message.includes('authenticate') ? '🔐 Authentication Required. Run `authenticate` tool.' : `Failed to list notebooks: ${error.message}` }] };
@@ -362,15 +404,192 @@ server.tool(
   }
 );
 
+// --- SharePoint Site Tools (Phase 1) ---
+
 server.tool(
-  'searchPages',
+  'searchSites',
   {
-    query: z.string().describe('The search term for page titles.').optional()
+    query: z.string().describe('Search term for the site name (e.g. "vorstand"). Use "*" for all sites.')
   },
   async ({ query }) => {
     try {
       await ensureGraphClient();
-      const apiResponse = await graphClient.api('/me/onenote/pages').get();
+      const response = await graphClient.api(`/sites?search=${encodeURIComponent(query)}`).get();
+      const sites = response.value || [];
+      if (sites.length === 0) {
+        return { content: [{ type: 'text', text: `🔍 No sites found matching "${query}".` }] };
+      }
+      const lines = sites.map((s, i) =>
+        `${i + 1}. ${s.displayName || s.name}\n   id: ${s.id}\n   url: ${s.webUrl}`
+      ).join('\n\n');
+      return { content: [{ type: 'text', text: `🌐 **SharePoint sites** (${sites.length} found):\n\n${lines}` }] };
+    } catch (error) {
+      return { isError: true, content: [{ type: 'text', text: `Failed to search sites: ${error.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  'getSiteByUrl',
+  {
+    siteUrl: z.string().describe('Full SharePoint site URL, e.g. https://contoso.sharepoint.com/sites/vorstand')
+  },
+  async ({ siteUrl }) => {
+    try {
+      await ensureGraphClient();
+      // Parse hostname and server-relative path from the URL
+      const u = new URL(siteUrl);
+      const hostname = u.hostname;
+      const sitePath = u.pathname.replace(/\/$/, ''); // strip trailing slash
+      const apiPath = sitePath
+        ? `/sites/${hostname}:${sitePath}`
+        : `/sites/${hostname}`;
+      const site = await graphClient.api(apiPath).get();
+      return {
+        content: [{
+          type: 'text',
+          text: `🌐 **${site.displayName || site.name}**\n   id: ${site.id}\n   url: ${site.webUrl}\n\n(Pass this id to listSiteNotebooks.)`
+        }]
+      };
+    } catch (error) {
+      return { isError: true, content: [{ type: 'text', text: `Failed to resolve site URL: ${error.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  'listSections',
+  {
+    siteId: z.string().describe('Optional SharePoint site id. Omit for personal notebooks.').optional(),
+    notebookId: z.string().describe('Optional notebook id to list sections under. Omit for top-level sections.').optional()
+  },
+  async ({ siteId, notebookId }) => {
+    try {
+      await ensureGraphClient();
+      const root = onenoteRoot(siteId);
+      const apiPath = notebookId
+        ? `${root}/notebooks/${notebookId}/sections`
+        : `${root}/sections`;
+      const response = await graphClient.api(apiPath).get();
+      const sections = response.value || [];
+      if (sections.length === 0) {
+        return { content: [{ type: 'text', text: '📑 No sections found.' }] };
+      }
+      const lines = sections.map((s, i) =>
+        `${i + 1}. **${s.displayName}**\n   ID: ${s.id}\n   Modified: ${new Date(s.lastModifiedDateTime).toLocaleDateString()}`
+      ).join('\n\n');
+      return { content: [{ type: 'text', text: `📑 **Sections** (${sections.length}):\n\n${lines}` }] };
+    } catch (error) {
+      return { isError: true, content: [{ type: 'text', text: `Failed to list sections: ${error.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  'useSite',
+  {
+    siteUrl: z.string().describe('Full SharePoint site URL, e.g. https://contoso.sharepoint.com/sites/vorstand. All subsequent OneNote calls will target this site until you call useMyOneNote.')
+  },
+  async ({ siteUrl }) => {
+    try {
+      await ensureGraphClient();
+      const u = new URL(siteUrl);
+      const hostname = u.hostname;
+      const sitePath = u.pathname.replace(/\/$/, '');
+      const apiPath = sitePath
+        ? `/sites/${hostname}:${sitePath}`
+        : `/sites/${hostname}`;
+      const site = await graphClient.api(apiPath).get();
+      currentSiteId = site.id;
+      currentSiteName = site.displayName || site.name;
+      // Persist so it survives Claude Desktop restarts.
+      fs.writeFileSync(defaultSitePath, JSON.stringify({
+        siteId: currentSiteId,
+        siteName: currentSiteName,
+        siteUrl: site.webUrl,
+        savedAt: new Date().toISOString()
+      }, null, 2));
+      return {
+        content: [{
+          type: 'text',
+          text: `📍 **Now using site: ${currentSiteName}**\n   id: ${currentSiteId}\n   url: ${site.webUrl}\n\nAll subsequent OneNote calls (listNotebooks, searchPages, getPageContent, edits, createPage, etc.) will target this site by default. This setting is saved to disk and will persist across Claude Desktop restarts. Call useMyOneNote to revert to your personal notebooks.`
+        }]
+      };
+    } catch (error) {
+      return { isError: true, content: [{ type: 'text', text: `Failed to set default site: ${error.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  'useMyOneNote',
+  {
+    // No input parameters
+  },
+  async () => {
+    try {
+      const wasUsing = currentSiteName;
+      currentSiteId = null;
+      currentSiteName = null;
+      if (fs.existsSync(defaultSitePath)) {
+        fs.unlinkSync(defaultSitePath);
+      }
+      const previous = wasUsing ? ` (previously: ${wasUsing})` : '';
+      return { content: [{ type: 'text', text: `📍 **Now using your personal OneNote.**${previous}\n\nAll subsequent calls will target /me/onenote.` }] };
+    } catch (error) {
+      return { isError: true, content: [{ type: 'text', text: `Failed to switch to personal OneNote: ${error.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  'getCurrentSite',
+  {
+    // No input parameters
+  },
+  async () => {
+    if (currentSiteId) {
+      return {
+        content: [{
+          type: 'text',
+          text: `📍 **Active context: ${currentSiteName}** (SharePoint site)\n   id: ${currentSiteId}\n\nCall useMyOneNote to switch back to personal OneNote, or useSite to switch to a different site.`
+        }]
+      };
+    }
+    return { content: [{ type: 'text', text: '📍 **Active context: your personal OneNote.**\n\nCall useSite <url> to switch to a SharePoint site.' }] };
+  }
+);
+
+server.tool(
+  'listSiteNotebooks',
+  {
+    siteId: z.string().describe('Site id from searchSites/getSiteByUrl (looks like "contoso.sharepoint.com,<guid>,<guid>").')
+  },
+  async ({ siteId }) => {
+    try {
+      await ensureGraphClient();
+      const response = await graphClient.api(`/sites/${siteId}/onenote/notebooks`).get();
+      if (response.value && response.value.length > 0) {
+        const notebookList = response.value.map((nb, i) => formatPageInfo(nb, i)).join('\n\n');
+        return { content: [{ type: 'text', text: `📚 **Notebooks on this site** (${response.value.length} found):\n\n${notebookList}` }] };
+      }
+      return { content: [{ type: 'text', text: '📚 No notebooks found on this site.' }] };
+    } catch (error) {
+      return { isError: true, content: [{ type: 'text', text: `Failed to list site notebooks: ${error.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  'searchPages',
+  {
+    query: z.string().describe('The search term for page titles.').optional(),
+    siteId: z.string().describe('Optional SharePoint site id (from getSiteByUrl/searchSites). Omit for personal notebooks.').optional()
+  },
+  async ({ query, siteId }) => {
+    try {
+      await ensureGraphClient();
+      const apiResponse = await graphClient.api(`${onenoteRoot(siteId)}/pages`).get();
       let pages = apiResponse.value || [];
       if (query) {
         const searchTerm = query.toLowerCase();
@@ -396,13 +615,14 @@ server.tool(
     format: z.enum(['text', 'html', 'summary'])
       .default('text')
       .describe('Format of the content: text (readable), html (raw), or summary (brief).')
-      .optional()
+      .optional(),
+    siteId: z.string().describe('Optional SharePoint site id. Omit for personal notebooks.').optional()
   },
-  async ({ pageId, format }) => {
+  async ({ pageId, format, siteId }) => {
     try {
       await ensureGraphClient();
-      const pageInfo = await graphClient.api(`/me/onenote/pages/${pageId}`).get();
-      const htmlContent = await fetchPageContentAdvanced(pageId, 'httpDirect');
+      const pageInfo = await graphClient.api(`${onenoteRoot(siteId)}/pages/${pageId}`).get();
+      const htmlContent = await fetchPageContentAdvanced(pageId, 'httpDirect', siteId);
       let resultText = '';
 
       if (format === 'html') {
@@ -428,12 +648,13 @@ server.tool(
     format: z.enum(['text', 'html', 'summary'])
       .default('text')
       .describe('Format of the content: text, html, or summary.')
-      .optional()
+      .optional(),
+    siteId: z.string().describe('Optional SharePoint site id. Omit for personal notebooks.').optional()
   },
-  async ({ title, format }) => {
+  async ({ title, format, siteId }) => {
     try {
       await ensureGraphClient();
-      const pagesResponse = await graphClient.api('/me/onenote/pages').get();
+      const pagesResponse = await graphClient.api(`${onenoteRoot(siteId)}/pages`).get();
       const matchingPage = (pagesResponse.value || []).find(p => p.title && p.title.toLowerCase().includes(title.toLowerCase()));
 
       if (!matchingPage) {
@@ -441,7 +662,7 @@ server.tool(
         return { isError: true, content: [{ type: 'text', text: `❌ No page found with title containing "${title}".\n\nAvailable pages (up to 10):\n${availablePages || 'None'}` }] };
       }
 
-      const htmlContent = await fetchPageContentAdvanced(matchingPage.id, 'httpDirect');
+      const htmlContent = await fetchPageContentAdvanced(matchingPage.id, 'httpDirect', siteId);
       let resultText = '';
       if (format === 'html') {
         resultText = `📄 **${matchingPage.title}** (HTML Format)\n\n${htmlContent}`;
@@ -469,14 +690,15 @@ server.tool(
     preserveTitle: z.boolean()
       .default(true)
       .describe('Keep the original title (default: true).')
-      .optional()
+      .optional(),
+    siteId: z.string().describe('Optional SharePoint site id. Omit for personal notebooks.').optional()
   },
-  async ({ pageId, content: newContent, preserveTitle }) => {
+  async ({ pageId, content: newContent, preserveTitle, siteId }) => {
     try {
       await ensureGraphClient();
-      const pageInfo = await graphClient.api(`/me/onenote/pages/${pageId}`).get();
+      const pageInfo = await graphClient.api(`${onenoteRoot(siteId)}/pages/${pageId}`).get();
       console.error(`Updating content for page: "${pageInfo.title}" (ID: ${pageId})`);
-      
+
       const htmlContentForUpdate = textToHtml(newContent);
       const finalHtml = `
         <div>
@@ -486,8 +708,8 @@ server.tool(
           <p><em>Updated via OneNote MCP on ${new Date().toLocaleString()}</em></p>
         </div>
       `;
-      
-      const url = `https://graph.microsoft.com/v1.0/me/onenote/pages/${pageId}/content`;
+
+      const url = `https://graph.microsoft.com/v1.0${onenoteRoot(siteId)}/pages/${pageId}/content`;
       const response = await fetch(url, {
         method: 'PATCH',
         headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
@@ -509,21 +731,22 @@ server.tool(
     pageId: z.string().describe('The ID of the page to append content to.'),
     content: z.string().describe('Content to append (HTML or markdown-style).'),
     addTimestamp: z.boolean().default(true).describe('Add a timestamp (default: true).').optional(),
-    addSeparator: z.boolean().default(true).describe('Add a visual separator (default: true).').optional()
+    addSeparator: z.boolean().default(true).describe('Add a visual separator (default: true).').optional(),
+    siteId: z.string().describe('Optional SharePoint site id. Omit for personal notebooks.').optional()
   },
-  async ({ pageId, content: newContent, addTimestamp, addSeparator }) => {
+  async ({ pageId, content: newContent, addTimestamp, addSeparator, siteId }) => {
     try {
       await ensureGraphClient();
-      const pageInfo = await graphClient.api(`/me/onenote/pages/${pageId}`).get();
+      const pageInfo = await graphClient.api(`${onenoteRoot(siteId)}/pages/${pageId}`).get();
       console.error(`Appending content to page: "${pageInfo.title}" (ID: ${pageId})`);
-      
+
       const htmlContentToAppend = textToHtml(newContent);
       let appendHtml = '';
       if (addSeparator) appendHtml += '<hr>';
       if (addTimestamp) appendHtml += `<p><em>Added on ${new Date().toLocaleString()}</em></p>`;
       appendHtml += htmlContentToAppend;
-      
-      const url = `https://graph.microsoft.com/v1.0/me/onenote/pages/${pageId}/content`;
+
+      const url = `https://graph.microsoft.com/v1.0${onenoteRoot(siteId)}/pages/${pageId}/content`;
       const response = await fetch(url, {
         method: 'PATCH',
         headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
@@ -543,16 +766,17 @@ server.tool(
   'updatePageTitle',
   {
     pageId: z.string().describe('The ID of the page whose title is to be updated.'),
-    newTitle: z.string().describe('The new title for the page.')
+    newTitle: z.string().describe('The new title for the page.'),
+    siteId: z.string().describe('Optional SharePoint site id. Omit for personal notebooks.').optional()
   },
-  async ({ pageId, newTitle }) => {
+  async ({ pageId, newTitle, siteId }) => {
     try {
       await ensureGraphClient();
-      const pageInfo = await graphClient.api(`/me/onenote/pages/${pageId}`).get();
+      const pageInfo = await graphClient.api(`${onenoteRoot(siteId)}/pages/${pageId}`).get();
       const oldTitle = pageInfo.title;
       console.error(`Updating page title from "${oldTitle}" to "${newTitle}" for page ID "${pageId}"`);
-      
-      const url = `https://graph.microsoft.com/v1.0/me/onenote/pages/${pageId}/content`;
+
+      const url = `https://graph.microsoft.com/v1.0${onenoteRoot(siteId)}/pages/${pageId}/content`;
       const response = await fetch(url, {
         method: 'PATCH',
         headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
@@ -574,25 +798,26 @@ server.tool(
     pageId: z.string().describe('The ID of the page to modify.'),
     findText: z.string().describe('The text to find and replace.'),
     replaceText: z.string().describe('The text to replace with.'),
-    caseSensitive: z.boolean().default(false).describe('Case-sensitive search (default: false).').optional()
+    caseSensitive: z.boolean().default(false).describe('Case-sensitive search (default: false).').optional(),
+    siteId: z.string().describe('Optional SharePoint site id. Omit for personal notebooks.').optional()
   },
-  async ({ pageId, findText, replaceText, caseSensitive }) => {
+  async ({ pageId, findText, replaceText, caseSensitive, siteId }) => {
     try {
       await ensureGraphClient();
-      const pageInfo = await graphClient.api(`/me/onenote/pages/${pageId}`).get();
-      const htmlContent = await fetchPageContentAdvanced(pageId, 'httpDirect');
+      const pageInfo = await graphClient.api(`${onenoteRoot(siteId)}/pages/${pageId}`).get();
+      const htmlContent = await fetchPageContentAdvanced(pageId, 'httpDirect', siteId);
       console.error(`Replacing text in page: "${pageInfo.title}" (ID: ${pageId})`);
-      
+
       const flags = caseSensitive ? 'g' : 'gi';
       const regex = new RegExp(findText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags);
       const matches = (htmlContent.match(regex) || []).length;
-      
+
       if (matches === 0) {
         return { content: [{ type: 'text', text: `ℹ️ **No matches found** for "${findText}" in page: ${pageInfo.title}.` }] };
       }
-      
+
       const updatedContent = htmlContent.replace(regex, replaceText);
-      const url = `https://graph.microsoft.com/v1.0/me/onenote/pages/${pageId}/content`;
+      const url = `https://graph.microsoft.com/v1.0${onenoteRoot(siteId)}/pages/${pageId}/content`;
       const response = await fetch(url, {
         method: 'PATCH',
         headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
@@ -620,14 +845,15 @@ server.tool(
     position: z.enum(['top', 'bottom'])
       .default('bottom')
       .describe('Position to add the note (top or bottom).')
-      .optional()
+      .optional(),
+    siteId: z.string().describe('Optional SharePoint site id. Omit for personal notebooks.').optional()
   },
-  async ({ pageId, note, noteType, position }) => {
+  async ({ pageId, note, noteType, position, siteId }) => {
     try {
       await ensureGraphClient();
-      const pageInfo = await graphClient.api(`/me/onenote/pages/${pageId}`).get();
+      const pageInfo = await graphClient.api(`${onenoteRoot(siteId)}/pages/${pageId}`).get();
       console.error(`Adding ${noteType} to page: "${pageInfo.title}" (ID: ${pageId}) at ${position}`);
-      
+
       const icons = { note: '📝', todo: '✅', important: '🚨', question: '❓' };
       const colors = { note: '#e3f2fd', todo: '#e8f5e8', important: '#ffebee', question: '#fff3e0' };
       const noteHtml = `
@@ -635,9 +861,9 @@ server.tool(
           <p><strong>${icons[noteType]} ${noteType.charAt(0).toUpperCase() + noteType.slice(1)}</strong> - <em>${new Date().toLocaleString()}</em></p>
           <p>${textToHtml(note)}</p>
         </div>`;
-      
+
       const action = position === 'top' ? 'prepend' : 'append';
-      const url = `https://graph.microsoft.com/v1.0/me/onenote/pages/${pageId}/content`;
+      const url = `https://graph.microsoft.com/v1.0${onenoteRoot(siteId)}/pages/${pageId}/content`;
       const response = await fetch(url, {
         method: 'PATCH',
         headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
@@ -662,24 +888,25 @@ server.tool(
     position: z.enum(['top', 'bottom'])
       .default('bottom')
       .describe('Position to add the table (top or bottom).')
-      .optional()
+      .optional(),
+    siteId: z.string().describe('Optional SharePoint site id. Omit for personal notebooks.').optional()
   },
-  async ({ pageId, tableData, title, position }) => {
+  async ({ pageId, tableData, title, position, siteId }) => {
     try {
       await ensureGraphClient();
-      const pageInfo = await graphClient.api(`/me/onenote/pages/${pageId}`).get();
+      const pageInfo = await graphClient.api(`${onenoteRoot(siteId)}/pages/${pageId}`).get();
       console.error(`Adding table to page: "${pageInfo.title}" (ID: ${pageId}) at ${position}`);
-      
+
       const rows = tableData.trim().split('\n').map(row => row.split(',').map(cell => cell.trim()));
       if (rows.length < 2) throw new Error('Table data must have at least a header row and one data row.');
-      
+
       const headerRow = rows[0];
       const dataRows = rows.slice(1);
       let tableHtml = title ? `<h3>📊 ${textToHtml(title)}</h3>` : '';
       tableHtml += `<table style="border-collapse: collapse; width: 100%; margin: 10px 0;"><thead><tr style="background-color: #f5f5f5;">${headerRow.map(cell => `<th style="border: 1px solid #ddd; padding: 8px; text-align: left;">${textToHtml(cell)}</th>`).join('')}</tr></thead><tbody>${dataRows.map(row => `<tr>${row.map(cell => `<td style="border: 1px solid #ddd; padding: 8px;">${textToHtml(cell)}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
-      
+
       const action = position === 'top' ? 'prepend' : 'append';
-      const url = `https://graph.microsoft.com/v1.0/me/onenote/pages/${pageId}/content`;
+      const url = `https://graph.microsoft.com/v1.0${onenoteRoot(siteId)}/pages/${pageId}/content`;
       const response = await fetch(url, {
         method: 'PATCH',
         headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
@@ -700,20 +927,26 @@ server.tool(
   'createPage',
   {
     title: z.string().min(1, { message: "Title cannot be empty." }).describe('The title for the new page.'),
-    content: z.string().min(1, { message: "Content cannot be empty." }).describe('The content for the new page (HTML or markdown-style).')
+    content: z.string().min(1, { message: "Content cannot be empty." }).describe('The content for the new page (HTML or markdown-style).'),
+    siteId: z.string().describe('Optional SharePoint site id. Omit for personal notebooks.').optional(),
+    sectionId: z.string().describe('Optional section id to create the page in. If omitted, uses the first section found.').optional()
   },
-  async ({ title, content }) => {
+  async ({ title, content, siteId, sectionId }) => {
     try {
       await ensureGraphClient();
-      console.error(`Attempting to create page with title: "${title}"`);
-      
-      const sectionsResponse = await graphClient.api('/me/onenote/sections').get();
-      if (!sectionsResponse.value || sectionsResponse.value.length === 0) {
-        throw new Error('No sections found in your OneNote. Cannot create a page.');
+      console.error(`Attempting to create page with title: "${title}"${siteId ? ` (site: ${siteId})` : ''}`);
+
+      let targetSectionId = sectionId;
+      let targetSectionName = sectionId || 'unknown';
+      if (!targetSectionId) {
+        const sectionsResponse = await graphClient.api(`${onenoteRoot(siteId)}/sections`).get();
+        if (!sectionsResponse.value || sectionsResponse.value.length === 0) {
+          throw new Error('No sections found. Cannot create a page. (Pass sectionId explicitly or check the notebook has at least one section.)');
+        }
+        targetSectionId = sectionsResponse.value[0].id;
+        targetSectionName = sectionsResponse.value[0].displayName;
       }
-      const targetSectionId = sectionsResponse.value[0].id;
-      const targetSectionName = sectionsResponse.value[0].displayName;
-      
+
       const htmlContent = textToHtml(content);
       const pageHtml = `<!DOCTYPE html>
 <html>
@@ -728,9 +961,9 @@ server.tool(
   <p><em>Created via OneNote MCP on ${new Date().toLocaleString()}</em></p>
 </body>
 </html>`;
-      
+
       const response = await graphClient
-        .api(`/me/onenote/sections/${targetSectionId}/pages`)
+        .api(`${onenoteRoot(siteId)}/sections/${targetSectionId}/pages`)
         .header('Content-Type', 'application/xhtml+xml')
         .post(pageHtml);
       
@@ -770,14 +1003,23 @@ async function main() {
     const transport = new StdioServerTransport();
     await server.connect(transport);
     
+    loadDefaultSite();
     console.error('🚀✨ OneNote Ultimate MCP Server is now LIVE! ✨🚀');
     console.error(`   Client ID: ${clientId.substring(0, 8)}... (Using ${process.env.AZURE_CLIENT_ID ? 'environment variable' : 'default'})`);
+    if (currentSiteId) {
+      console.error(`   📍 Active context: ${currentSiteName || currentSiteId} (SharePoint)`);
+    } else {
+      console.error('   📍 Active context: personal OneNote');
+    }
     console.error('   Ready to manage your OneNote like never before!');
     console.error('--- Available Tool Categories ---');
     console.error('   🔐 Auth: authenticate, saveAccessToken');
     console.error('   📚 Read: listNotebooks, searchPages, getPageContent, getPageByTitle');
+    console.error('   🌐 Sites: searchSites, getSiteByUrl, listSiteNotebooks, listSections');
+    console.error('   📍 Context: useSite, useMyOneNote, getCurrentSite');
     console.error('   ✏️ Edit: updatePageContent, appendToPage, updatePageTitle, replaceTextInPage, addNoteToPage, addTableToPage');
     console.error('   ➕ Create: createPage');
+    console.error('   ℹ️  Most tools accept optional siteId to override the active context per-call.');
     console.error('---------------------------------');
     
     process.on('SIGINT', () => {

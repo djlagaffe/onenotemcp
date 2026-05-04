@@ -9,23 +9,24 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/eshlon/onenote-mcp-server.git"
+    "url": "git+https://github.com/djlagaffe/onenotemcp.git"
   },
   "keywords": [
     "mcp",
     "model-context-protocol",
     "onenote",
+    "sharepoint",
     "microsoft-graph",
     "llm",
     "ai",
     "claude"
   ],
-  "author": "Ehsan Shahabi",
+  "author": "Ehsan Shahabi (upstream); SharePoint fork by djlagaffe",
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/[eshlon/onenote-mcp-server/issues"
+    "url": "https://github.com/djlagaffe/onenotemcp/issues"
   },
-  "homepage": "https://github.com/[eshlon/onenote-mcp-server#readme",
+  "homepage": "https://github.com/djlagaffe/onenotemcp#readme",
   "dependencies": {
     "@azure/identity": "^4.1.0",
     "@microsoft/microsoft-graph-client": "^3.0.7",

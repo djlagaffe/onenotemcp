@@ -8,6 +8,8 @@ package-lock.json
 # Project-specific files
 # CRITICAL: Contains sensitive authentication token
 .access-token.txt
+# Persisted default-site preference (per-user setting)
+.default-site.json
 *.log
 
 # Environment variables

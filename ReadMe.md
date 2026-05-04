@@ -1,207 +1,379 @@
-# OneNote MCP Server
+# OneNote MCP Server (SharePoint-aware fork)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-The OneNote MCP Server is a powerful Model Context Protocol (MCP) server that enables AI language models (LLMs) like Claude, and other AI assistants, to securely interact with your Microsoft OneNote data. It allows for reading, writing, searching, and comprehensive editing of your OneNote notebooks, sections, and pages directly through your AI interface.
+A Model Context Protocol (MCP) server that lets Claude (and other MCP-capable
+assistants) read, write, search, and edit Microsoft OneNote — including notebooks
+that live on SharePoint sites, not just personal OneDrive.
 
-This server provides a rich set of tools for advanced OneNote management, including robust text extraction, HTML content processing, and fine-grained page manipulation.
+This is a fork of [eshlon/onenotemcp](https://github.com/eshlon/onenotemcp) with
+fixes and feature work that were necessary to make it work in real
+work-account / SharePoint scenarios. See [What's new in this fork](#whats-new-in-this-fork)
+below.
 
 ## Features
 
-*   **Authentication:** Secure device code flow for Microsoft Graph API access.
-*   **Read Operations:**
-    *   List notebooks, sections, and pages.
-    *   Search pages by title.
-    *   Get page content in various formats (full HTML, readable text, summary).
-*   **Write & Edit Operations:**
-    *   Create new OneNote pages with custom HTML or markdown content.
-    *   Update entire page content, preserving or replacing the title.
-    *   Append content to existing pages with optional timestamps and separators.
-    *   Update page titles.
-    *   Find and replace text within pages (case-sensitive or insensitive).
-    *   Add formatted notes (like callouts or todos) to pages.
-    *   Insert structured tables into pages from CSV data.
-*   **Advanced Content Processing:**
-    *   Sophisticated HTML to readable text extraction.
-    *   Markdown-to-HTML conversion for page content.
-*   **Robust Input Validation:** Uses Zod for defining and validating tool input schemas.
+* **Authentication** — secure device-code flow against Microsoft Graph, with
+  configurable tenant.
+* **Read** — list notebooks/sections/pages, search by title, fetch page content
+  as readable text, raw HTML, or short summary.
+* **Write & edit** — create new pages, replace or append page content, rename
+  pages, find/replace text, add formatted notes (note / todo / important /
+  question), insert tables from CSV.
+* **SharePoint sites** — every read/write tool optionally targets a SharePoint
+  site instead of `/me`, so shared team notebooks (e.g. Vorstand, Sales,
+  Engineering) are first-class.
+* **Session context** — set a default site once with `useSite`, and every
+  subsequent call uses it. The setting persists across restarts.
+* **Robust HTML processing** — JSDOM-based extraction, markdown-style input
+  conversion.
+* **Zod schemas** for tool input validation.
 
+## What's new in this fork
+
+Compared to the upstream [eshlon/onenotemcp](https://github.com/eshlon/onenotemcp):
+
+| Area | Change |
+|---|---|
+| **Auth** | Configurable `tenantId` so the server works against single-tenant work apps (the upstream defaults to `organizations` and fails with `invalid_grant` for personal accounts and certain tenant configurations). |
+| **Auth crash** | Hardens the `authenticate` flow against unhandled rejections that previously killed the MCP process whenever Azure rejected the device-code grant. |
+| **SharePoint** | New tools `searchSites`, `getSiteByUrl`, `listSiteNotebooks`, `listSections` — discover and enumerate notebooks living on SharePoint sites. |
+| **Site-scoped tools** | Every existing read/edit/create tool now accepts an optional `siteId` parameter. Path resolution flips between `/me/onenote/...` and `/sites/{id}/onenote/...` automatically. |
+| **Session default** | `useSite(siteUrl)`, `useMyOneNote()`, `getCurrentSite()` — set a working site once, and every subsequent call uses it. Persists to `.default-site.json` so it survives Claude Desktop restarts. |
+| **Scopes** | Adds `Notes.Read.All`, `Notes.ReadWrite.All`, `Sites.Read.All` so the server can actually read shared/site notebooks. |
+| **Misc** | Fixed broken `bugs`/`homepage` URLs in `package.json`; added `.default-site.json` to `.gitignore`. |
+
+A standalone `test-auth.mjs` is included to validate Azure App Registration
+configuration outside Claude Desktop — useful for debugging `invalid_grant`
+errors.
 
 ## Prerequisites
 
-*   **Node.js:** Version 18.x or later is recommended. (Install from [nodejs.org](https://nodejs.org/))
-*   **npm:** Usually comes bundled with Node.js.
-*   **Git:** For cloning the repository. (Install from [git-scm.com](https://git-scm.com/))
-*   **Microsoft Account:** An active Microsoft account with access to OneNote.
-*   **Azure Application Registration (Recommended for Production/Shared Use):**
-    *   While the server defaults to using the Microsoft Graph Explorer's public Client ID for easy testing, for regular or shared use, it is **strongly recommended** to create your own Azure App Registration.
-    *   Ensure your app registration has the following delegated Microsoft Graph API permissions: `Notes.Read`, `Notes.ReadWrite`, `Notes.Create`, `User.Read`.
-    *   You will need the "Application (client) ID" from your app registration.
+* **Node.js 18+** ([nodejs.org](https://nodejs.org/))
+* **Git**
+* **Microsoft account** with access to OneNote (personal, work, or school)
+* **Azure App Registration** — strongly recommended (the upstream "use the Graph
+  Explorer client ID" shortcut works for some flows but reliably fails for
+  single-tenant work accounts and any flow that needs `*.All` permissions).
 
 ## Installation
 
-1.  **Clone the Repository:**
-    ```bash
-    git clone https://github.com/[your-github-username]/onenote-ultimate-mcp-server.git
-    cd onenote-ultimate-mcp-server
-    ```
-    *(Replace `[your-github-username]/onenote-ultimate-mcp-server` with your actual repository URL)*
-
-2.  **Install Dependencies:**
-    ```bash
-    npm install
-    ```
-
-## Configuration
-
-1.  **Azure Client ID:**
-    This server requires an Azure Application Client ID to authenticate with Microsoft Graph.
-    *   **Recommended for Production/Shared Use:** Set the `AZURE_CLIENT_ID` environment variable to your own Azure App's "Application (client) ID".
-        ```bash
-        export AZURE_CLIENT_ID="your-actual-azure-app-client-id" 
-        ```
-        (On Windows, use `set AZURE_CLIENT_ID=your-actual-azure-app-client-id`)
-    *   **For Quick Testing:** If the `AZURE_CLIENT_ID` environment variable is not set, the server will default to using the Microsoft Graph Explorer's public Client ID. This is suitable for initial testing but not recommended for prolonged or shared use.
-    *   Alternatively, you can modify the `clientId` variable directly in `onenote-mcp.mjs`, but using an environment variable is preferred.
-
-2.  **`.gitignore`:**
-    The project includes a `.gitignore` file. Ensure it contains at least the following to prevent committing sensitive files:
-    ```
-    node_modules/
-    .DS_Store
-    *.log
-    .access-token.txt
-    .env
-    ```
-    The `.access-token.txt` file will be created by the server to store your authentication token.
-
-## Running the MCP Server
-
-Once configured, start the server from the project's root directory:
-
 ```bash
-node onenote-mcp.mjs
+git clone https://github.com/djlagaffe/onenotemcp.git
+cd onenotemcp
+npm install
 ```
 
-You should see console output indicating the server has started and listing the available tool categories.
+## Azure App Registration setup
 
-## Connecting to an MCP Client
+This is the part that bites everyone. Do all of it:
 
-You can connect this server to any MCP-compatible client, such as Claude Desktop or Cursor.
+1. **Portal → App registrations → + New registration**
+   * Name: anything (e.g. `OneNote MCP`)
+   * **Supported account types:**
+     * Personal Microsoft account → "Accounts in any organizational directory and personal Microsoft accounts"
+     * Single-tenant work/school → "Accounts in this organizational directory only"
+     * Multi-tenant + personal → "Accounts in any organizational directory and personal Microsoft accounts"
+   * Redirect URI: leave blank
+   * Copy the **Application (client) ID** and **Directory (tenant) ID** from the Overview page after registration
 
-**Example for Claude Desktop or Cursor:**
+2. **Authentication blade**
+   * Scroll to **Advanced settings** → **Allow public client flows** → **Yes** → Save
 
-1.  Open your MCP client's configuration file.
-    *   **Claude Desktop (macOS):** `~/Library/Application Support/Claude/claude_desktop_config.json`
-    *   **Claude Desktop (Windows):** `%APPDATA%\Claude\claude_desktop_config.json`
-    *   **Cursor:** Preferences -> MCP tab.
+3. **API permissions blade** → **+ Add a permission** → **Microsoft Graph** → **Delegated permissions** — add:
+   * `User.Read`
+   * `Notes.Read`
+   * `Notes.ReadWrite`
+   * `Notes.Create`
+   * `Notes.Read.All` (required for SharePoint site notebooks)
+   * `Notes.ReadWrite.All` (required for editing site notebooks)
+   * `Sites.Read.All` (required to look up sites by URL/name)
+   * Click **Grant admin consent for &lt;your tenant&gt;**. The `*.All` scopes typically require admin rights — if the button is greyed out, ask whoever administers your M365 tenant to do this step.
 
-2.  Add or update the `mcpServers` configuration:
+4. **Decide which tenant value to use**
 
-    ```json
-    {
-      "mcpServers": {
-        "onenote": {
-          "command": "node",
-          "args": ["/full/path/to/your/onenote-ultimate-mcp-server/onenote-mcp.mjs"],
-          "env": {
-            // Recommended: Set AZURE_CLIENT_ID here if not set globally
-            "AZURE_CLIENT_ID": "YOUR_AZURE_APP_CLIENT_ID_HERE" 
-          }
-        }
+   The server reads the tenant from the `AZURE_TENANT_ID` environment variable
+   (configured in your Claude Desktop config — see next section). Pick:
+
+   * **Single-tenant work/school app:** your Directory (tenant) ID GUID
+     (visible on the Overview page of the app registration)
+   * **Multi-tenant or mixed (work + personal):** `common`
+   * **Personal-only:** `consumers`
+
+   If you don't set `AZURE_TENANT_ID`, the server defaults to `common`. That's
+   fine for personal Microsoft accounts and multi-tenant apps, but
+   single-tenant work apps will fail with `invalid_grant` until you set the
+   correct tenant GUID.
+
+## Configuring the Claude Desktop MCP entry
+
+### 1. Find the config file
+
+Claude Desktop reads its MCP servers from a JSON file. Open it in any text
+editor — if it doesn't exist yet, create it.
+
+| OS | Path |
+|---|---|
+| **Windows** | `%APPDATA%\Claude\claude_desktop_config.json` |
+| **macOS** | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| **Linux** | `~/.config/Claude/claude_desktop_config.json` |
+
+On Windows you can paste `%APPDATA%\Claude\` into File Explorer's address bar
+to jump straight there. The folder is normally
+`C:\Users\<you>\AppData\Roaming\Claude\`.
+
+### 2. Add the `onenote` entry
+
+If the file is empty, paste this whole block:
+
+```json
+{
+  "mcpServers": {
+    "onenote": {
+      "command": "node",
+      "args": ["C:\\full\\path\\to\\onenotemcp\\onenote-mcp.mjs"],
+      "env": {
+        "AZURE_CLIENT_ID": "<your-application-client-id>",
+        "AZURE_TENANT_ID": "<your-tenant-id-or-common-or-consumers>"
       }
     }
-    ```
+  }
+}
+```
 
-    *   Replace `/full/path/to/your/onenote-ultimate-mcp-server/` with the **absolute path** to where you cloned the repository.
-    *   Replace `YOUR_AZURE_APP_CLIENT_ID_HERE` with your Azure App's Client ID, especially if you are not setting it as a system-wide environment variable.
+If you already have other MCP servers configured, just add the `onenote` key
+inside the existing `mcpServers` object — don't nest a second `mcpServers`:
 
-3.  Restart your MCP client (Claude Desktop/Cursor).
+```json
+{
+  "mcpServers": {
+    "filesystem": { "command": "...", "args": ["..."] },
+    "onenote": {
+      "command": "node",
+      "args": ["C:\\full\\path\\to\\onenotemcp\\onenote-mcp.mjs"],
+      "env": {
+        "AZURE_CLIENT_ID": "<your-application-client-id>",
+        "AZURE_TENANT_ID": "<your-tenant-id-or-common-or-consumers>"
+      }
+    }
+  }
+}
+```
 
-## Authentication Flow
+### 3. What each field means
 
-The first time you try to use a OneNote tool through your AI assistant, or by explicitly invoking the `authenticate` tool:
+| Field | Value |
+|---|---|
+| `"onenote"` | The display name shown in Claude Desktop. You can rename this; the rest of the docs just assume it's `onenote`. |
+| `command` | `"node"` — the Node.js executable. Must be on your PATH, or use the absolute path (e.g. `"C:\\Program Files\\nodejs\\node.exe"`). |
+| `args` | A single-element array containing the absolute path to `onenote-mcp.mjs` from this repo. **On Windows, escape every backslash as `\\`** in JSON. |
+| `env.AZURE_CLIENT_ID` | The "Application (client) ID" GUID from your Azure App Registration. Required. |
+| `env.AZURE_TENANT_ID` | Your Directory (tenant) ID GUID for single-tenant work apps, `common` for multi-tenant or mixed personal+work, or `consumers` for personal-only. Defaults to `common` if omitted. |
 
-1.  **Invoke `authenticate` Tool:** Your AI assistant will call the `authenticate` tool on the server.
-2.  **Device Code Prompt:** The server will output a URL (typically `https://microsoft.com/devicelogin`) and a user code to its `stderr`. Your MCP client (e.g., Claude Desktop) should display this information to you.
-3.  **Browser Authentication:** Open the provided URL in a web browser and enter the user code.
-4.  **Sign In & Grant Permissions:** Sign in with your Microsoft account that has OneNote access and grant the requested permissions.
-5.  **Token Saved:** Upon successful browser authentication, the server will automatically receive and save the access token to an `.access-token.txt` file in its directory.
-6.  **Verify (Optional but Recommended):** Invoke the `saveAccessToken` tool through your AI assistant. This tool doesn't actually save (as it's already saved by the background process) but rather loads and verifies the token, confirming successful authentication and displaying your account info.
+Optional extra `env` entries you may want:
 
-The saved token will be used for subsequent sessions until it expires, at which point you may need to re-authenticate.
+```json
+"env": {
+  "AZURE_CLIENT_ID": "...",
+  "AZURE_TENANT_ID": "...",
+  "PATH": "C:\\Program Files\\nodejs;C:\\Windows\\System32"
+}
+```
 
-## Available MCP Tools
+The explicit `PATH` entry only matters if `node` isn't being resolved
+automatically (you'd see a `spawn node ENOENT` error in the log).
 
-This server exposes the following tools to your AI assistant:
+### 4. Worked examples
 
-**Authentication:**
-*   `authenticate`: Initiates the device code authentication flow with Microsoft Graph.
-*   `saveAccessToken`: Loads and verifies the locally saved access token.
+Replace the GUIDs with your own values from the app registration's Overview
+page.
 
-**Reading OneNote Data:**
-*   `listNotebooks`: Lists all your OneNote notebooks.
-*   `searchPages`: Searches for pages by title across all notebooks. (Arg: `query` (optional string))
-*   `getPageContent`: Retrieves the content of a specific OneNote page. (Args: `pageId` (string), `format` (enum: "text", "html", "summary", optional, default: "text"))
-*   `getPageByTitle`: Finds a page by its title and retrieves its content. (Args: `title` (string), `format` (enum: "text", "html", "summary", optional, default: "text"))
+**Windows (using forward slashes — also valid in JSON):**
 
-**Editing & Creating OneNote Pages:**
-*   `createPage`: Creates a new OneNote page in the first available section. (Args: `title` (string), `content` (string - HTML or markdown))
-*   `updatePageContent`: Replaces the entire content of an existing page. (Args: `pageId` (string), `content` (string), `preserveTitle` (boolean, optional, default: true))
-*   `appendToPage`: Adds new content to the end of an existing page. (Args: `pageId` (string), `content` (string), `addTimestamp` (boolean, optional, default: true), `addSeparator` (boolean, optional, default: true))
-*   `updatePageTitle`: Changes the title of an existing page. (Args: `pageId` (string), `newTitle` (string))
-*   `replaceTextInPage`: Finds and replaces text within a page. (Args: `pageId` (string), `findText` (string), `replaceText` (string), `caseSensitive` (boolean, optional, default: false))
-*   `addNoteToPage`: Adds a formatted, timestamped note/comment to a page. (Args: `pageId` (string), `note` (string), `noteType` (enum: "note", "todo", "important", "question", optional, default: "note"), `position` (enum: "top", "bottom", optional, default: "bottom"))
-*   `addTableToPage`: Adds a formatted table to a page from CSV data. (Args: `pageId` (string), `tableData` (string - CSV), `title` (string, optional), `position` (enum: "top", "bottom", optional, default: "bottom"))
+```json
+{
+  "mcpServers": {
+    "onenote": {
+      "command": "node",
+      "args": ["D:/path/to/onenotemcp/onenote-mcp.mjs"],
+      "env": {
+        "AZURE_CLIENT_ID": "00000000-0000-0000-0000-000000000000",
+        "AZURE_TENANT_ID": "00000000-0000-0000-0000-000000000000"
+      }
+    }
+  }
+}
+```
 
-## Example Interactions with AI
+**macOS:**
 
-Once connected and authenticated, you can ask your AI assistant to perform tasks like:
+```json
+{
+  "mcpServers": {
+    "onenote": {
+      "command": "node",
+      "args": ["/Users/yourname/code/onenotemcp/onenote-mcp.mjs"],
+      "env": {
+        "AZURE_CLIENT_ID": "00000000-0000-0000-0000-000000000000",
+        "AZURE_TENANT_ID": "common"
+      }
+    }
+  }
+}
+```
 
-*   "List my OneNote notebooks."
-*   "Create a new OneNote page titled 'Meeting Ideas' with the content 'Brainstorm new marketing strategies'."
-*   "Can you find my OneNote page about 'Project Phoenix' and tell me its summary?"
-*   "Append 'Follow up with John Doe' to the OneNote page with ID 'your-page-id-here'."
-*   "In my OneNote page 'Recipe Ideas', replace all instances of 'sugar' with 'sweetener'."
+### 5. Restart Claude Desktop
 
+Save the file, then **fully quit Claude Desktop** — system tray icon → Quit on
+Windows, or ⌘Q on macOS. Closing the window is not enough; the MCP config is
+only re-read when the app actually exits and restarts.
 
+When you relaunch and open a chat, you should see OneNote's tools listed
+(authenticate, listNotebooks, useSite, …). If they're not there, check the
+log:
+
+* **Windows:** `%APPDATA%\Claude\logs\mcp-server-onenote.log`
+* **macOS:** `~/Library/Logs/Claude/mcp-server-onenote.log`
+
+The log is the single most useful debugging tool — it shows the spawn command,
+the JSON-RPC handshake, and any stderr output from the server.
+
+## First-run authentication
+
+In a Claude Desktop chat:
+
+1. Run the `authenticate` tool. It prints a URL (`https://microsoft.com/devicelogin`) and a 9-character code.
+2. Open the URL, enter the code, sign in, and approve the permissions prompt.
+3. The token is saved to `.access-token.txt` in the project directory and reused on subsequent runs.
+
+If `authenticate` fails with `invalid_grant`, run `node test-auth.mjs` from the
+project directory after setting `AZURE_CLIENT_ID` — it prints the full Azure
+error response and is much easier to debug than reading Claude Desktop logs.
+
+## Working with SharePoint site notebooks
+
+```
+useSite https://contoso.sharepoint.com/sites/marketing
+```
+
+After that, every OneNote tool call (`listNotebooks`, `searchPages`,
+`getPageContent`, `appendToPage`, `createPage`, …) targets the marketing site
+notebooks by default. The setting persists to `.default-site.json` and is
+restored automatically on every server restart.
+
+To look up a site you don't yet have a URL for:
+
+```
+searchSites query=Marketing
+```
+
+To switch:
+
+```
+useSite https://contoso.sharepoint.com/sites/sales
+```
+
+To revert to your personal OneNote:
+
+```
+useMyOneNote
+```
+
+To check which scope is currently active:
+
+```
+getCurrentSite
+```
+
+You can also pass `siteId=<id>` on any tool call to override the default for
+just that call without changing the default.
+
+## Tool reference
+
+### Auth
+| Tool | Args |
+|---|---|
+| `authenticate` | — |
+| `saveAccessToken` | — |
+
+### Context
+| Tool | Args |
+|---|---|
+| `useSite` | `siteUrl: string` |
+| `useMyOneNote` | — |
+| `getCurrentSite` | — |
+
+### Site discovery
+| Tool | Args |
+|---|---|
+| `searchSites` | `query: string` |
+| `getSiteByUrl` | `siteUrl: string` |
+| `listSiteNotebooks` | `siteId: string` |
+| `listSections` | `siteId?: string`, `notebookId?: string` |
+
+### Read
+| Tool | Args |
+|---|---|
+| `listNotebooks` | `siteId?: string` |
+| `searchPages` | `query?: string`, `siteId?: string` |
+| `getPageContent` | `pageId: string`, `format?: 'text'\|'html'\|'summary'`, `siteId?: string` |
+| `getPageByTitle` | `title: string`, `format?: 'text'\|'html'\|'summary'`, `siteId?: string` |
+
+### Edit
+| Tool | Args |
+|---|---|
+| `updatePageContent` | `pageId`, `content`, `preserveTitle?`, `siteId?` |
+| `appendToPage` | `pageId`, `content`, `addTimestamp?`, `addSeparator?`, `siteId?` |
+| `updatePageTitle` | `pageId`, `newTitle`, `siteId?` |
+| `replaceTextInPage` | `pageId`, `findText`, `replaceText`, `caseSensitive?`, `siteId?` |
+| `addNoteToPage` | `pageId`, `note`, `noteType?`, `position?`, `siteId?` |
+| `addTableToPage` | `pageId`, `tableData (CSV)`, `title?`, `position?`, `siteId?` |
+
+### Create
+| Tool | Args |
+|---|---|
+| `createPage` | `title`, `content`, `siteId?`, `sectionId?` |
+
+For every tool that takes `siteId`, omitting it falls back to (in order): the
+session default set by `useSite`, otherwise `/me/onenote`.
 
 ## Troubleshooting
 
-*   **Authentication Issues:**
-    *   Ensure your `AZURE_CLIENT_ID` (if set) is correct and has the required API permissions.
-    *   If the device code flow fails, try in a different browser or an incognito/private window.
-    *   Token expiry: If tools stop working, you may need to re-run the `authenticate` tool.
-*   **Server Not Starting:**
-    *   Check Node.js version (`node -v`).
-    *   Ensure all dependencies are installed (`npm install`).
-*   **MCP Client Issues (e.g., Claude Desktop, Cursor):**
-    *   Verify the `command` and `args` (especially the absolute path to `onenote-mcp.mjs`) in your client's MCP server configuration are correct.
-    *   Restart the MCP client after making configuration changes.
-    *   Check the MCP client's logs and the server's console output for errors.
+| Symptom | Likely cause |
+|---|---|
+| `invalid_grant` during `authenticate` | Tenant mismatch (single-tenant app + wrong tenantId), or missing "Allow public client flows" |
+| `AADSTS65001: needs admin consent` | Click "Grant admin consent" in the API permissions blade — admin only |
+| `listNotebooks` returns nothing for a known site notebook | The notebook is on a SharePoint site — use `useSite` first, or pass `siteId=` |
+| Tools work in `test-auth.mjs` but not Claude Desktop | `AZURE_CLIENT_ID` not set in `claude_desktop_config.json`, or Claude Desktop wasn't fully quit |
+| Server crashes on `authenticate` with no error to client | Run `node onenote-mcp.mjs` directly in PowerShell to see the stderr trace |
 
+## Security
 
-## Security Notes
-
-*   **Access Token Security:** The `.access-token.txt` file contains a token that grants access to your OneNote data according to the defined scopes. Protect this file as you would any sensitive credential. Ensure it is included in your `.gitignore` file.
-*   **Azure Client ID:** If you create your own Azure App Registration, keep its client secret (if any generated for other flows) secure. For this device code flow, a client secret is not used by this script.
-*   **Permissions:** This server requests `Notes.ReadWrite` and `Notes.Create` permissions. Be aware of the access you are granting.
+* `.access-token.txt` and `.default-site.json` are both in `.gitignore`. Don't
+  commit them.
+* `Notes.ReadWrite.All` lets the signed-in user (and therefore this MCP) read
+  and write any OneNote notebook the user can access. Treat the access token
+  as you would your password.
 
 ## Acknowledgements
 
-This project was developed with inspiration and by adapting patterns from the following open-source projects:
+This fork builds on a chain of community work. Credit where due:
 
-*   **[onenote-mcp](https://github.com/danosb/onenote-mcp) by danosb:** This project served as an early inspiration and provided reference for structuring a OneNote MCP server, particularly for initial concepts around authentication and basic OneNote operations.
+* **[eshlon/onenotemcp](https://github.com/eshlon/onenotemcp)** by Ehsan Shahabi
+  — the direct upstream this fork is based on. Brought together the rich set
+  of editing tools, JSDOM-based HTML processing, Zod schemas, and the overall
+  structure.
+* **[ZubeidHendricks/azure-onenote-mcp-server](https://github.com/ZubeidHendricks/azure-onenote-mcp-server)**
+  — provided the device-code authentication pattern, token-cache strategy, and
+  foundational Graph-API wrapping conventions.
+* **[danosb/onenote-mcp](https://github.com/danosb/onenote-mcp)** — earlier
+  reference for structuring a OneNote MCP server.
 
+The SharePoint site support, session-default context, tenant-aware auth, and
+crash hardening in this fork are new contributions on top of that lineage.
 
-*   **[azure-onenote-mcp-server](https://github.com/ZubeidHendricks/azure-onenote-mcp-server) by Zubeid Hendricks:** The core authentication flow using Device Code Credentials, token storage/retrieval strategy, and foundational patterns for wrapping Microsoft Graph API calls for OneNote (such as listing entities and creating pages) as MCP tools were significantly informed by or adapted from this project. This project is licensed under the MIT License.
-
-The extensive set of editing tools, advanced text extraction and HTML processing utilities, Zod schema integration, and the overall refined structure of this server are original contributions. 
-
-Development of this server was also assisted by AI language models, including Anthropic's Claude and Google's Gemini, for tasks such as code generation, refactoring, debugging, and documentation.
-
-We are grateful to the authors of the referenced projects and the developers of the AI tools for their contributions to the open-source and development communities.
+Development of this fork was assisted by Anthropic's Claude.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+MIT — see [LICENSE](LICENSE).
