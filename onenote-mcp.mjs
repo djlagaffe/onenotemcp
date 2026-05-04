@@ -307,15 +307,17 @@ server.tool(
       await new Promise(resolve => setTimeout(resolve, 2000)); // Allow time for userPromptCallback
 
       if (deviceCodeInfo) {
-        const authMessage = `🔐 **AUTHENTICATION REQUIRED**
+        const oneClickUrl = `https://microsoft.com/devicelogin?otc=${deviceCodeInfo.userCode}`;
+        const authMessage = `🔐 **Sign in to OneNote**
 
-Please complete the following steps:
-1. **Open this URL in your browser:** https://microsoft.com/devicelogin
-2. **Enter this code:** ${deviceCodeInfo.userCode}
-3. **Sign in with your Microsoft account that has OneNote access.**
-4. **After completing authentication, use the 'saveAccessToken' tool.**
+**One-click link (code pre-filled):** ${oneClickUrl}
 
-Token will be saved automatically upon successful browser authentication.`;
+Or manually:
+1. Open https://microsoft.com/devicelogin
+2. Enter code: **${deviceCodeInfo.userCode}**
+3. Sign in with the Microsoft account that has access to your OneNote / SharePoint.
+
+The token saves automatically as soon as browser sign-in completes — no follow-up tool call needed.`;
 
         authPromise.then(tokenResponse => {
           accessToken = tokenResponse.token;
