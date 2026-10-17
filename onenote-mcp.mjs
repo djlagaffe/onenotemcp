@@ -2,7 +2,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { Client } from '@microsoft/microsoft-graph-client';
-import { DeviceCodeCredential } from '@azure/identity';
 import { JSDOM } from 'jsdom';
 import fs from 'fs';
 import path from 'path';
@@ -36,36 +35,142 @@ const server = new McpServer({
 // AUTHENTICATION & MICROSOFT GRAPH CLIENT MANAGEMENT
 // ============================================================================
 
+const authority = `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0`;
+const authScope = [...scopes, 'offline_access'].join(' ');
+
+// Token state: { token, refreshToken, expiresAtMs }
+let tokenState = { token: null, refreshToken: null, expiresAtMs: 0 };
+let refreshInFlight = null;
+
 /**
- * Loads an existing access token from the local file system.
+ * Loads tokens from the local file (JSON; legacy plain-text access token still accepted).
  */
 function loadExistingToken() {
   try {
-    if (fs.existsSync(tokenFilePath)) {
-      const tokenData = fs.readFileSync(tokenFilePath, 'utf8');
-      try {
-        const parsedToken = JSON.parse(tokenData); // New format: JSON object
-        accessToken = parsedToken.token;
-        console.error('Loaded existing token from file (JSON format).');
-      } catch (parseError) {
-        accessToken = tokenData; // Old format: plain token string
-        console.error('Loaded existing token from file (plain text format).');
-      }
+    if (!fs.existsSync(tokenFilePath)) return;
+    const raw = fs.readFileSync(tokenFilePath, 'utf8');
+    try {
+      const p = JSON.parse(raw);
+      tokenState = {
+        token: p.token || null,
+        refreshToken: p.refreshToken || null,
+        expiresAtMs: p.expiresOn ? Date.parse(p.expiresOn) : 0
+      };
+    } catch {
+      tokenState = { token: raw.trim(), refreshToken: null, expiresAtMs: 0 };
     }
+    accessToken = tokenState.token;
   } catch (error) {
     console.error(`Error loading token: ${error.message}`);
   }
 }
 
+function saveTokenState() {
+  const data = {
+    token: tokenState.token,
+    refreshToken: tokenState.refreshToken,
+    clientId,
+    tenantId,
+    scopes,
+    updatedAt: new Date().toISOString(),
+    expiresOn: new Date(tokenState.expiresAtMs).toISOString()
+  };
+  fs.writeFileSync(tokenFilePath, JSON.stringify(data, null, 2), { mode: 0o600 });
+  try { fs.chmodSync(tokenFilePath, 0o600); } catch {}
+}
+
+async function tokenRequest(params) {
+  const res = await fetch(`${authority}/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ client_id: clientId, ...params })
+  });
+  const body = await res.json().catch(() => ({}));
+  return { ok: res.ok, body };
+}
+
+function applyTokenResponse(body) {
+  tokenState = {
+    token: body.access_token,
+    // refresh tokens rotate; keep the old one if none is returned
+    refreshToken: body.refresh_token || tokenState.refreshToken,
+    expiresAtMs: Date.now() + (Number(body.expires_in) || 3600) * 1000
+  };
+  accessToken = tokenState.token;
+  saveTokenState();
+}
+
 /**
- * Initializes the Microsoft Graph client if an access token is available.
- * @returns {Client | null} The initialized Graph client or null.
+ * Returns a valid access token, refreshing silently via the refresh token when needed.
+ * @throws {Error} If no token exists or the refresh token is no longer valid.
+ */
+async function getAccessToken() {
+  if (!tokenState.token && !tokenState.refreshToken) loadExistingToken();
+  if (tokenState.token && tokenState.expiresAtMs - Date.now() > 5 * 60 * 1000) return tokenState.token;
+
+  // Another process (e.g. CLI login) may have written a newer token
+  loadExistingToken();
+  if (tokenState.token && tokenState.expiresAtMs - Date.now() > 5 * 60 * 1000) return tokenState.token;
+
+  if (!tokenState.refreshToken) {
+    throw new Error('No valid token. Please authenticate first (tool "authenticate" or: node onenote-mcp.mjs --auth).');
+  }
+  if (!refreshInFlight) {
+    refreshInFlight = (async () => {
+      const { ok, body } = await tokenRequest({
+        grant_type: 'refresh_token',
+        refresh_token: tokenState.refreshToken,
+        scope: authScope
+      });
+      if (!ok) {
+        throw new Error(`Token refresh failed (${body.error || 'unknown'}): ${body.error_description || ''}. Re-authenticate (node onenote-mcp.mjs --auth).`.trim());
+      }
+      applyTokenResponse(body);
+      console.error('Access token refreshed silently.');
+      return tokenState.token;
+    })().finally(() => { refreshInFlight = null; });
+  }
+  return refreshInFlight;
+}
+
+/**
+ * Starts a device code flow. Returns { info, done } where done resolves once sign-in completed.
+ */
+async function startDeviceLogin() {
+  const res = await fetch(`${authority}/devicecode`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ client_id: clientId, scope: authScope })
+  });
+  const info = await res.json();
+  if (!res.ok) throw new Error(`Device code request failed: ${info.error_description || info.error}`);
+  const done = (async () => {
+    const deadline = Date.now() + (info.expires_in || 900) * 1000;
+    let interval = (info.interval || 5) * 1000;
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, interval));
+      const { ok, body } = await tokenRequest({
+        grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+        device_code: info.device_code
+      });
+      if (ok) { applyTokenResponse(body); return; }
+      if (body.error === 'authorization_pending') continue;
+      if (body.error === 'slow_down') { interval += 5000; continue; }
+      throw new Error(`${body.error}: ${body.error_description || ''}`);
+    }
+    throw new Error('Device code expired before sign-in completed.');
+  })();
+  return { info, done };
+}
+
+/**
+ * Initializes the Microsoft Graph client. The auth provider fetches a fresh token per request.
  */
 function initializeGraphClient() {
-  if (accessToken && !graphClient) {
+  if (!graphClient) {
     graphClient = Client.init({
       authProvider: (done) => {
-        done(null, accessToken);
+        getAccessToken().then(t => done(null, t), e => done(e, null));
       }
     });
     console.error('Microsoft Graph client initialized.');
@@ -74,22 +179,11 @@ function initializeGraphClient() {
 }
 
 /**
- * Ensures the Graph client is initialized and authenticated.
- * Loads token if not present, then initializes client.
- * @throws {Error} If no access token is available after attempting to load.
- * @returns {Promise<Client>} The initialized and authenticated Graph client.
+ * Ensures a valid token exists (refreshing if needed) and the Graph client is initialized.
  */
 async function ensureGraphClient() {
-  if (!accessToken) {
-    loadExistingToken();
-  }
-  if (!accessToken) {
-    throw new Error('No access token available. Please authenticate first using the "authenticate" tool.');
-  }
-  if (!graphClient) {
-    initializeGraphClient();
-  }
-  return graphClient;
+  await getAccessToken();
+  return initializeGraphClient();
 }
 
 // ============================================================================
@@ -256,7 +350,7 @@ async function fetchPageContentAdvanced(pageId, method = 'httpDirect', siteId = 
   const root = onenoteRoot(siteId);
   if (method === 'httpDirect') {
     const url = `https://graph.microsoft.com/v1.0${root}/pages/${pageId}/content`;
-    const response = await fetch(url, { headers: { 'Authorization': `Bearer ${accessToken}` } });
+    const response = await fetch(url, { headers: { 'Authorization': `Bearer ${await getAccessToken()}` } });
     if (!response.ok) throw new Error(`HTTP error fetching page content! Status: ${response.status} ${response.statusText}`);
     return await response.text();
   } else { // 'direct'
@@ -293,52 +387,22 @@ server.tool(
   async () => {
     try {
       console.error('Starting device code authentication...');
-      let deviceCodeInfo = null;
-      const credential = new DeviceCodeCredential({
-        clientId: clientId,
-        tenantId: tenantId,
-        userPromptCallback: (info) => {
-          deviceCodeInfo = info;
-          console.error(`\n=== AUTHENTICATION REQUIRED ===\n${info.message}\n================================\n`);
-        }
-      });
-
-      const authPromise = credential.getToken(scopes);
-      await new Promise(resolve => setTimeout(resolve, 2000)); // Allow time for userPromptCallback
-
-      if (deviceCodeInfo) {
-        const oneClickUrl = `https://microsoft.com/devicelogin?otc=${deviceCodeInfo.userCode}`;
-        const authMessage = `🔐 **Sign in to OneNote**
+      const { info, done } = await startDeviceLogin();
+      console.error(`\n=== AUTHENTICATION REQUIRED ===\n${info.message}\n================================\n`);
+      const oneClickUrl = `https://microsoft.com/devicelogin?otc=${info.user_code}`;
+      const authMessage = `🔐 **Sign in to OneNote**
 
 **One-click link (code pre-filled):** ${oneClickUrl}
 
 Or manually:
 1. Open https://microsoft.com/devicelogin
-2. Enter code: **${deviceCodeInfo.userCode}**
+2. Enter code: **${info.user_code}**
 3. Sign in with the Microsoft account that has access to your OneNote / SharePoint.
 
-The token saves automatically as soon as browser sign-in completes — no follow-up tool call needed.`;
-
-        authPromise.then(tokenResponse => {
-          accessToken = tokenResponse.token;
-          const tokenData = {
-            token: accessToken,
-            clientId: clientId,
-            scopes: scopes,
-            createdAt: new Date().toISOString(),
-            expiresOn: tokenResponse.expiresOnTimestamp ? new Date(tokenResponse.expiresOnTimestamp).toISOString() : null
-          };
-          fs.writeFileSync(tokenFilePath, JSON.stringify(tokenData, null, 2));
-          console.error('Token saved successfully!');
-          initializeGraphClient();
-        }).catch(error => {
-          console.error(`Background authentication failed: ${error.message}`);
-        });
-        
-        return { content: [{ type: 'text', text: authMessage }] };
-      } else {
-        return { isError: true, content: [{ type: 'text', text: 'Could not retrieve device code information. Please try again or check console logs.' }] };
-      }
+The token (incl. refresh token) saves automatically as soon as browser sign-in completes — no follow-up tool call needed.`;
+      done.then(() => { console.error('Token saved successfully!'); initializeGraphClient(); })
+          .catch(error => console.error(`Background authentication failed: ${error.message}`));
+      return { content: [{ type: 'text', text: authMessage }] };
     } catch (error) {
       return { isError: true, content: [{ type: 'text', text: `Authentication failed: ${error.message}` }] };
     }
@@ -357,8 +421,8 @@ server.tool(
   async () => {
     try {
       loadExistingToken();
-      if (accessToken) {
-        initializeGraphClient();
+      if (tokenState.token || tokenState.refreshToken) {
+        await ensureGraphClient();
         const testResponse = await graphClient.api('/me').get();
         return {
           content: [{
@@ -714,7 +778,7 @@ server.tool(
       const url = `https://graph.microsoft.com/v1.0${onenoteRoot(siteId)}/pages/${pageId}/content`;
       const response = await fetch(url, {
         method: 'PATCH',
-        headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+        headers: { 'Authorization': `Bearer ${await getAccessToken()}`, 'Content-Type': 'application/json' },
         body: JSON.stringify([{ target: 'body', action: 'replace', content: finalHtml }])
       });
       
@@ -751,7 +815,7 @@ server.tool(
       const url = `https://graph.microsoft.com/v1.0${onenoteRoot(siteId)}/pages/${pageId}/content`;
       const response = await fetch(url, {
         method: 'PATCH',
-        headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+        headers: { 'Authorization': `Bearer ${await getAccessToken()}`, 'Content-Type': 'application/json' },
         body: JSON.stringify([{ target: 'body', action: 'append', content: appendHtml }])
       });
       
@@ -781,7 +845,7 @@ server.tool(
       const url = `https://graph.microsoft.com/v1.0${onenoteRoot(siteId)}/pages/${pageId}/content`;
       const response = await fetch(url, {
         method: 'PATCH',
-        headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+        headers: { 'Authorization': `Bearer ${await getAccessToken()}`, 'Content-Type': 'application/json' },
         body: JSON.stringify([{ target: 'title', action: 'replace', content: newTitle }])
       });
       
@@ -822,7 +886,7 @@ server.tool(
       const url = `https://graph.microsoft.com/v1.0${onenoteRoot(siteId)}/pages/${pageId}/content`;
       const response = await fetch(url, {
         method: 'PATCH',
-        headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+        headers: { 'Authorization': `Bearer ${await getAccessToken()}`, 'Content-Type': 'application/json' },
         body: JSON.stringify([{ target: 'body', action: 'replace', content: `<div>${updatedContent}</div>` }])
       });
       
@@ -868,7 +932,7 @@ server.tool(
       const url = `https://graph.microsoft.com/v1.0${onenoteRoot(siteId)}/pages/${pageId}/content`;
       const response = await fetch(url, {
         method: 'PATCH',
-        headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+        headers: { 'Authorization': `Bearer ${await getAccessToken()}`, 'Content-Type': 'application/json' },
         body: JSON.stringify([{ target: 'body', action: action, content: noteHtml }])
       });
       
@@ -911,7 +975,7 @@ server.tool(
       const url = `https://graph.microsoft.com/v1.0${onenoteRoot(siteId)}/pages/${pageId}/content`;
       const response = await fetch(url, {
         method: 'PATCH',
-        headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+        headers: { 'Authorization': `Bearer ${await getAccessToken()}`, 'Content-Type': 'application/json' },
         body: JSON.stringify([{ target: 'body', action: action, content: tableHtml }])
       });
       
@@ -996,9 +1060,16 @@ server.tool(
  * Main function to initialize and start the MCP server.
  */
 async function main() {
+  if (process.argv.includes('--auth')) {
+    const { info, done } = await startDeviceLogin();
+    console.log(`\n${info.message}\n`);
+    await done;
+    console.log('Login successful. Token + refresh token saved to ' + tokenFilePath);
+    process.exit(0);
+  }
   loadExistingToken(); // Attempt to load token at startup
-  if (accessToken) {
-    initializeGraphClient(); // Initialize client if token was loaded
+  if (tokenState.token || tokenState.refreshToken) {
+    initializeGraphClient();
   }
 
   try {
