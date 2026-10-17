@@ -359,6 +359,39 @@ async function fetchPageContentAdvanced(pageId, method = 'httpDirect', siteId = 
 }
 
 /**
+ * Lists pages section by section instead of via the flat /pages endpoint, which
+ * Graph rejects outright ("Encrypted sections are not accessible") as soon as one
+ * section in the scope is password-protected. Inaccessible sections are skipped.
+ * @param {string} [siteId] - Optional SharePoint site id.
+ * @param {string} [sectionId] - Optional section id to restrict the listing to.
+ * @returns {Promise<{pages: object[], skipped: string[]}>} Pages (newest first, with sectionName) and names of skipped sections.
+ */
+async function listPagesBySection(siteId = undefined, sectionId = undefined) {
+  await ensureGraphClient();
+  const root = onenoteRoot(siteId);
+  const sections = sectionId
+    ? [await graphClient.api(`${root}/sections/${sectionId}`).select('id,displayName').get()]
+    : ((await graphClient.api(`${root}/sections`).select('id,displayName').top(100).get()).value || []);
+  const pages = [];
+  const skipped = [];
+  for (const section of sections) {
+    try {
+      let next = `${root}/sections/${section.id}/pages?$select=id,title,createdDateTime,lastModifiedDateTime&$top=100`;
+      while (next) {
+        const res = await graphClient.api(next).get();
+        for (const p of res.value || []) pages.push({ ...p, sectionName: section.displayName });
+        next = res['@odata.nextLink'] || null;
+      }
+    } catch (err) {
+      if (sectionId) throw err;
+      skipped.push(section.displayName);
+    }
+  }
+  pages.sort((a, b) => new Date(b.lastModifiedDateTime) - new Date(a.lastModifiedDateTime));
+  return { pages, skipped };
+}
+
+/**
  * Formats OneNote page information for display.
  * @param {object} page - The OneNote page object from Graph API.
  * @param {number | null} [index=null] - Optional index for numbered lists.
@@ -367,7 +400,8 @@ async function fetchPageContentAdvanced(pageId, method = 'httpDirect', siteId = 
 function formatPageInfo(page, index = null) {
   const prefix = index !== null ? `${index + 1}. ` : '';
   const name = page.displayName || page.title; // Use displayName for notebooks, title for pages
-  return `${prefix}**${name}**
+  const section = page.sectionName ? `\n   Section: ${page.sectionName}` : '';
+  return `${prefix}**${name}**${section}
    ID: ${page.id}
    Created: ${new Date(page.createdDateTime).toLocaleDateString()}
    Modified: ${new Date(page.lastModifiedDateTime).toLocaleDateString()}`;
@@ -650,23 +684,23 @@ server.tool(
   'searchPages',
   {
     query: z.string().describe('The search term for page titles.').optional(),
-    siteId: z.string().describe('Optional SharePoint site id (from getSiteByUrl/searchSites). Omit for personal notebooks.').optional()
+    siteId: z.string().describe('Optional SharePoint site id (from getSiteByUrl/searchSites). Omit for personal notebooks.').optional(),
+    sectionId: z.string().describe('Optional section id (from listSections) to search only that section.').optional()
   },
-  async ({ query, siteId }) => {
+  async ({ query, siteId, sectionId }) => {
     try {
-      await ensureGraphClient();
-      const apiResponse = await graphClient.api(`${onenoteRoot(siteId)}/pages`).get();
-      let pages = apiResponse.value || [];
+      let { pages, skipped } = await listPagesBySection(siteId, sectionId);
       if (query) {
         const searchTerm = query.toLowerCase();
         pages = pages.filter(page => page.title && page.title.toLowerCase().includes(searchTerm));
       }
+      const skippedNote = skipped.length ? `\n\n🔒 Skipped inaccessible sections: ${skipped.join(', ')}` : '';
       if (pages.length > 0) {
-        const pageList = pages.slice(0, 10).map((page, i) => formatPageInfo(page, i)).join('\n\n');
-        const morePages = pages.length > 10 ? `\n\n... and ${pages.length - 10} more pages.` : '';
-        return { content: [{ type: 'text', text: `🔍 **Search Results** ${query ? `for "${query}"` : ''} (${pages.length} found):\n\n${pageList}${morePages}` }] };
+        const pageList = pages.slice(0, 25).map((page, i) => formatPageInfo(page, i)).join('\n\n');
+        const morePages = pages.length > 25 ? `\n\n... and ${pages.length - 25} more pages.` : '';
+        return { content: [{ type: 'text', text: `🔍 **Search Results** ${query ? `for "${query}"` : ''} (${pages.length} found):\n\n${pageList}${morePages}${skippedNote}` }] };
       } else {
-        return { content: [{ type: 'text', text: query ? `🔍 No pages found matching "${query}".` : '📄 No pages found.' }] };
+        return { content: [{ type: 'text', text: (query ? `🔍 No pages found matching "${query}".` : '📄 No pages found.') + skippedNote }] };
       }
     } catch (error) {
       return { isError: true, content: [{ type: 'text', text: `Failed to search pages: ${error.message}` }] };
@@ -719,12 +753,11 @@ server.tool(
   },
   async ({ title, format, siteId }) => {
     try {
-      await ensureGraphClient();
-      const pagesResponse = await graphClient.api(`${onenoteRoot(siteId)}/pages`).get();
-      const matchingPage = (pagesResponse.value || []).find(p => p.title && p.title.toLowerCase().includes(title.toLowerCase()));
+      const { pages: allPages } = await listPagesBySection(siteId);
+      const matchingPage = allPages.find(p => p.title && p.title.toLowerCase().includes(title.toLowerCase()));
 
       if (!matchingPage) {
-        const availablePages = (pagesResponse.value || []).slice(0, 10).map(p => `- ${p.title}`).join('\n');
+        const availablePages = allPages.slice(0, 10).map(p => `- ${p.title}`).join('\n');
         return { isError: true, content: [{ type: 'text', text: `❌ No page found with title containing "${title}".\n\nAvailable pages (up to 10):\n${availablePages || 'None'}` }] };
       }
 
